@@ -18,20 +18,20 @@ limitations under the License.
 package memcache
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
 	"io/ioutil"
 	"net"
-	"runtime"
 	"sync"
+	"syscall"
 	"time"
 )
 
 // Similar to:
 // http://code.google.com/appengine/docs/go/memcache/reference.html
-
 var (
 	// ErrCacheMiss means that a Get failed because the item wasn't present.
 	ErrCacheMiss = errors.New("memcache: cache miss")
@@ -74,14 +74,140 @@ var (
 	bUint64   = binary.BigEndian.Uint64
 )
 
-// DefaultTimeout is the default socket read/write timeout.
-const DefaultTimeout = time.Duration(100) * time.Millisecond
-
-const (
-	buffered            = 8 // arbitrary buffered channel size, for readability
-	maxIdleConnsPerAddr = 2 // TODO(bradfitz): make this configurable?
+var (
+	_writerPool = sync.Pool{
+		New: func() interface{} {
+			return bufio.NewWriter(nil)
+		},
+	}
 )
 
+// DefaultPoolTimeout is the default pool timeout
+// DefaultSocketTimeout is the default socket timeout
+// DefaultBufPoolSize is the default size for buffer pool
+// maxIdleConnsPerAddr is the default size for connection pool
+const (
+	DefaultSocketTimeout = 0
+	DefaultBufPoolSize   = 200000
+	DefaultKeepAlive     = time.Duration(10) * time.Second
+	maxIdleConnsPerAddr  = 10
+)
+
+// ==================================================================
+// ConnPool
+// ==================================================================
+type ConnPool struct {
+	pool  sync.Pool
+	limit chan struct{}
+}
+
+func getConnWrapper(c *Client, addr *Addr) func() *conn {
+	return func() *conn {
+		cn, err := c.getNewConn(addr)
+		if err != nil {
+			return nil
+		}
+		return cn
+	}
+}
+
+func newConnPool(lim int, fn func() *conn) *ConnPool {
+	// init connection pool
+	p := ConnPool{
+		pool: sync.Pool{
+			New: func() interface{} {
+				return fn()
+			},
+		},
+		limit: make(chan struct{}, lim),
+	}
+	// set idle connections
+	for i := 0; i < lim; i++ {
+		p.Put(fn())
+	}
+	return &p
+}
+
+func (p *ConnPool) Get() *conn {
+	// total connections <= upperlimit
+	select {
+	case <-p.limit:
+	/* ignore */
+	default:
+		/* ignore */
+	}
+	return p.pool.Get().(*conn)
+}
+
+func (p *ConnPool) Put(c *conn) {
+	select {
+	// total idle connetions <= limit
+	case p.limit <- struct{}{}:
+		p.pool.Put(c)
+	default:
+		c.nc.Close()
+	}
+}
+
+// ==================================================================
+// BufferPool
+// ==================================================================
+type BufPool struct {
+	pool  sync.Pool
+	limit chan struct{}
+}
+
+func newBufPool(lim int) *BufPool {
+	p := BufPool{
+		pool: sync.Pool{
+			New: func() interface{} {
+				// 24 is header size
+				arr := make([]byte, 24, 24)
+				return &arr
+			},
+		},
+		limit: make(chan struct{}, lim),
+	}
+	for i := 0; i < lim; i++ {
+		arr := make([]byte, 24, 24)
+		p.Put(&arr)
+	}
+	return &p
+
+}
+
+func (p *BufPool) CleanBuf(b *[]byte) *[]byte {
+	arr := *b
+	for i, _ := range arr {
+		arr[i] = byte(0)
+	}
+	*b = arr
+	return b
+}
+
+func (p *BufPool) Get() *[]byte {
+	// total buffers <= limit
+	select {
+	case <-p.limit:
+	/* ignore */
+	default:
+		/* ignore */
+	}
+	return p.pool.Get().(*[]byte)
+}
+
+func (p *BufPool) Put(b *[]byte) {
+	select {
+	case p.limit <- struct{}{}:
+		p.pool.Put(b)
+	default:
+		b = nil
+	}
+}
+
+// ==================================================================
+// commands
+// ==================================================================
 type command uint8
 
 const (
@@ -114,6 +240,9 @@ const (
 	cmdPrependQ
 )
 
+// ==================================================================
+// responses
+// ==================================================================
 type response uint16
 
 const (
@@ -180,6 +309,9 @@ const (
 	respMagic uint8 = 0x81
 )
 
+// ==================================================================
+// functions
+// ==================================================================
 func legalKey(key string) bool {
 	if len(key) > 250 {
 		return false
@@ -193,13 +325,10 @@ func legalKey(key string) bool {
 }
 
 func poolSize() int {
-	s := 8
-	if mp := runtime.GOMAXPROCS(0); mp > s {
-		s = mp
-	}
-	return s
+	return DefaultBufPoolSize
 }
 
+// ==================================================================
 // New returns a memcache client using the provided server(s)
 // with equal weight. If a server is listed multiple times,
 // it gets a proportional amount of weight.
@@ -213,15 +342,23 @@ func New(server ...string) (*Client, error) {
 
 // NewFromServers returns a new Client using the provided Servers.
 func NewFromServers(servers Servers) *Client {
-	return &Client{
-		timeout:        DefaultTimeout,
+	cli := &Client{
+		timeout:        DefaultSocketTimeout,
 		maxIdlePerAddr: maxIdleConnsPerAddr,
 		servers:        servers,
-		freeconn:       make(map[string]chan *conn),
-		bufPool:        make(chan []byte, poolSize()),
+		freeconn:       make(map[string]*ConnPool),
+		bufPool:        newBufPool(poolSize()),
 	}
+	freeconn := make(map[string]*ConnPool)
+	addrList, _ := servers.Servers()
+	for _, addr := range addrList {
+		freeconn[addr.s] = newConnPool(maxIdleConnsPerAddr, getConnWrapper(cli, addr))
+	}
+	cli.freeconn = freeconn
+	return cli
 }
 
+// ==================================================================
 // Client is a memcache client.
 // It is safe for unlocked use by multiple concurrent goroutines.
 type Client struct {
@@ -229,23 +366,23 @@ type Client struct {
 	maxIdlePerAddr int
 	servers        Servers
 	mu             sync.RWMutex
-	freeconn       map[string]chan *conn
-	bufPool        chan []byte
+	freeconn       map[string]*ConnPool
+	bufPool        *BufPool
 }
 
 // Timeout returns the socket read/write timeout. By default, it's
-// DefaultTimeout.
+// DefaultSocketTimeout.
 func (c *Client) Timeout() time.Duration {
 	return c.timeout
 }
 
 // SetTimeout specifies the socket read/write timeout.
-// If zero, DefaultTimeout is used. If < 0, there's
+// If zero, DefaultSocketTimeout is used. If < 0, there's
 // no timeout. This method must be called before any
 // connections to the memcached server are opened.
 func (c *Client) SetTimeout(timeout time.Duration) {
 	if timeout == time.Duration(0) {
-		timeout = DefaultTimeout
+		timeout = DefaultSocketTimeout
 	}
 	c.timeout = timeout
 }
@@ -268,22 +405,11 @@ func (c *Client) SetMaxIdleConnsPerAddr(maxIdle int) {
 	defer c.mu.Unlock()
 	c.maxIdlePerAddr = maxIdle
 	if maxIdle > 0 {
-		freeconn := make(map[string]chan *conn)
-		for k, v := range c.freeconn {
-			ch := make(chan *conn, maxIdle)
-		ChanDone:
-			for {
-				select {
-				case cn := <-v:
-					select {
-					case ch <- cn:
-					default:
-						cn.nc.Close()
-					}
-				default:
-					freeconn[k] = ch
-					break ChanDone
-				}
+		c.closeIdleConns()
+		freeconn := make(map[string]*ConnPool)
+		if servers, serversErr := c.servers.Servers(); serversErr == nil {
+			for _, addr := range servers {
+				freeconn[addr.s] = newConnPool(maxIdle, getConnWrapper(c, addr))
 			}
 		}
 		c.freeconn = freeconn
@@ -303,6 +429,7 @@ func (c *Client) Close() error {
 	return nil
 }
 
+// ==================================================================
 // Item is an item to be got or stored in a memcached server.
 type Item struct {
 	// Key is the Item's key (250 bytes maximum).
@@ -310,9 +437,6 @@ type Item struct {
 
 	// Value is the Item's value.
 	Value []byte
-
-	// Object is the Item's value for use with a Codec.
-	Object interface{}
 
 	// Flags are server-opaque flags whose semantics are entirely
 	// up to the app.
@@ -327,6 +451,7 @@ type Item struct {
 	casid uint64
 }
 
+// ==================================================================
 // conn is a connection to a server.
 type conn struct {
 	nc   net.Conn
@@ -341,59 +466,66 @@ func (c *Client) condRelease(cn *conn, err *error) {
 	switch *err {
 	case nil, ErrCacheMiss, ErrCASConflict, ErrNotStored, ErrBadIncrDec:
 		c.putFreeConn(cn)
+	case syscall.EPIPE:
+		if cn != nil && cn.nc != nil {
+			cn.nc.Close()
+			cn = nil
+		}
 	default:
-		cn.nc.Close()
+		if cn != nil {
+			if ne, ok := (*err).(net.Error); ok && ne.Temporary() {
+				c.putFreeConn(cn)
+			} else if cn.nc != nil {
+				cn.nc.Close()
+			}
+			cn = nil
+		}
 	}
 }
 
 func (c *Client) closeIdleConns() {
-	for _, v := range c.freeconn {
-	NextIdle:
-		for {
-			select {
-			case cn := <-v:
-				cn.nc.Close()
-			default:
-				break NextIdle
+	// please exec mu.Lock in caller
+	if c.freeconn == nil {
+		return
+	}
+	for k, v := range c.freeconn {
+		if v.limit != nil {
+			for len(v.limit) > 0 {
+				cn := v.Get()
+				if cn != nil && cn.nc != nil {
+					cn.nc.Close()
+					cn = nil
+				}
+				if cn == nil {
+					break
+				}
 			}
+			c.freeconn[k] = nil
 		}
 	}
 }
 
 func (c *Client) putFreeConn(cn *conn) {
 	c.mu.RLock()
+	defer c.mu.RUnlock()
 	freelist := c.freeconn[cn.addr.s]
-	maxIdle := c.maxIdlePerAddr
-	c.mu.RUnlock()
-	if freelist == nil && maxIdle > 0 {
-		freelist = make(chan *conn, maxIdle)
-		c.mu.Lock()
-		c.freeconn[cn.addr.s] = freelist
-		c.mu.Unlock()
-	}
-	select {
-	case freelist <- cn:
-		break
-	default:
-		cn.nc.Close()
-	}
-}
-
-func (c *Client) getFreeConn(addr *Addr) *conn {
-	c.mu.RLock()
-	freelist := c.freeconn[addr.s]
-	c.mu.RUnlock()
 	if freelist == nil {
-		return nil
+		return
 	}
-	select {
-	case cn := <-freelist:
-		return cn
-	default:
-		return nil
-	}
+	freelist.Put(cn)
 }
 
+func (c *Client) getFreeConn(addr *Addr) (*conn, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	freelist := c.freeconn[addr.s]
+	if freelist == nil {
+		return nil, ErrServerError
+	}
+	return freelist.Get(), nil
+}
+
+// ==================================================================
 // ConnectTimeoutError is the error type used when it takes
 // too long to connect to the desired host. This level of
 // detail can generally be ignored.
@@ -427,79 +559,114 @@ func (c *Client) dial(addr *Addr) (net.Conn, error) {
 	return net.Dial(addr.n, addr.s)
 }
 
-func (c *Client) getConn(addr *Addr) (*conn, error) {
-	cn := c.getFreeConn(addr)
-	if cn == nil {
-		nc, err := c.dial(addr)
-		if err != nil {
-			return nil, err
-		}
-		cn = &conn{
-			nc:   nc,
-			addr: addr,
-		}
+func (c *Client) getNewConn(addr *Addr) (*conn, error) {
+	nc, err := c.dial(addr)
+	if err != nil {
+		return nil, err
+	}
+	cn := &conn{
+		nc:   nc,
+		addr: addr,
 	}
 	if c.timeout > 0 {
-		cn.nc.SetDeadline(time.Now().Add(c.timeout))
+		nc.SetDeadline(time.Now().Add(c.timeout))
+	}
+	if _, ok := nc.(*net.TCPConn); ok {
+		err = nc.(*net.TCPConn).SetKeepAlive(true)
+		if err != nil {
+			nc.Close()
+			cn = nil
+			return nil, err
+		}
+		err = nc.(*net.TCPConn).SetKeepAlivePeriod(DefaultKeepAlive)
+		if err != nil {
+			nc.Close()
+			cn = nil
+			return nil, err
+		}
 	}
 	return cn, nil
 }
 
+// ==================================================================
 // Get gets the item for the given key. ErrCacheMiss is returned for a
 // memcache cache miss. The key must be at most 250 bytes in length.
 func (c *Client) Get(key string) (*Item, error) {
 	cn, err := c.sendCommand(key, cmdGet, nil, 0, nil)
 	if err != nil {
+		c.condRelease(cn, &err)
 		return nil, err
 	}
 	return c.parseItemResponse(key, cn, true)
 }
 
 func (c *Client) sendCommand(key string, cmd command, value []byte, casid uint64, extras []byte) (*conn, error) {
+	// check key length
+	if !legalKey(key) {
+		return nil, ErrMalformedKey
+	}
+
+	// get connection and send command
 	addr, err := c.servers.PickServer(key)
 	if err != nil {
 		return nil, err
 	}
-	cn, err := c.getConn(addr)
+	cn, err := c.getFreeConn(addr)
 	if err != nil {
 		return nil, err
 	}
 	err = c.sendConnCommand(cn, key, cmd, value, casid, extras)
 	if err != nil {
-		cn.nc.Close()
-		return nil, err
+		// retry once
+		cn, err = c.getFreeConn(addr)
+		if err != nil {
+			return nil, err
+		}
+		err = c.sendConnCommand(cn, key, cmd, value, casid, extras)
+		if err != nil {
+			return nil, err
+		}
+		return cn, err
 	}
 	return cn, err
 }
 
 func (c *Client) sendConnCommand(cn *conn, key string, cmd command, value []byte, casid uint64, extras []byte) (err error) {
-	var buf []byte
-	select {
-	// 24 is header size
-	case buf = <-c.bufPool:
-		buf = buf[:24]
-	default:
-		buf = make([]byte, 24, 24+len(key)+len(extras))
-		// Magic (0)
-		buf[0] = reqMagic
-	}
+	// get buffer from pool
+	bufp := c.bufPool.Get()
+	buf := *bufp
+	buf = buf[:24]
+	buf[0] = reqMagic
+
+	// put buffer into pool
+	defer func() {
+		*bufp = buf
+		bufp = c.bufPool.CleanBuf(bufp)
+		c.bufPool.Put(bufp)
+	}()
+
 	// Command (1)
 	buf[1] = byte(cmd)
 	kl := len(key)
 	el := len(extras)
+
 	// Key length (2-3)
 	putUint16(buf[2:], uint16(kl))
+
 	// Extras length (4)
 	buf[4] = byte(el)
+
 	// Data type (5), always zero
 	// VBucket (6-7), always zero
 	// Total body length (8-11)
 	vl := len(value)
 	bl := uint32(kl + el + vl)
 	putUint32(buf[8:], bl)
+
 	// Opaque (12-15), always zero
 	// CAS (16-23)
 	putUint64(buf[16:], casid)
+
 	// Extras
 	if el > 0 {
 		buf = append(buf, extras...)
@@ -508,24 +675,38 @@ func (c *Client) sendConnCommand(cn *conn, key string, cmd command, value []byte
 		// Key itself
 		buf = append(buf, stobs(key)...)
 	}
-	if _, err = cn.nc.Write(buf); err != nil {
+	writer := _writerPool.Get().(*bufio.Writer)
+	defer _writerPool.Put(writer)
+	writer.Reset(cn.nc)
+	if _, err = writer.Write(buf); err != nil {
 		return err
 	}
-	select {
-	case c.bufPool <- buf:
-	default:
-	}
 	if vl > 0 {
-		if _, err = cn.nc.Write(value); err != nil {
+		if _, err = writer.Write(value); err != nil {
 			return err
 		}
+	}
+	if err = writer.Flush(); err != nil {
+		return err
 	}
 	return nil
 }
 
 func (c *Client) parseResponse(rKey string, cn *conn) ([]byte, []byte, []byte, []byte, error) {
 	var err error
-	hdr := make([]byte, 24)
+
+	// get buffer from pool
+	hdrp := c.bufPool.Get()
+	hdr := *hdrp
+	hdr = hdr[:24]
+
+	// put buffer into pool
+	defer func() {
+		*hdrp = hdr
+		hdrp = c.bufPool.CleanBuf(hdrp)
+		c.bufPool.Put(hdrp)
+	}()
+
 	if err = readAtLeast(cn.nc, hdr, 24); err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -543,31 +724,33 @@ func (c *Client) parseResponse(rKey string, cn *conn) ([]byte, []byte, []byte, [
 		}
 		return nil, nil, nil, nil, response(status).asError()
 	}
-	var extras []byte
-	el := int(hdr[4])
-	if el > 0 {
-		extras = make([]byte, el)
+
+	var bp int
+	var bufLen int = total + len(hdr)
+	var extras, key, value, valBuf []byte = nil, nil, nil, nil
+	valBuf = make([]byte, bufLen, bufLen)
+	if el := int(hdr[4]); el > 0 {
+		extras = valBuf[0:el]
+		bp += el
 		if err = readAtLeast(cn.nc, extras, el); err != nil {
 			return nil, nil, nil, nil, err
 		}
 	}
-	var key []byte
-	kl := int(bUint16(hdr[2:4]))
-	if kl > 0 {
-		key = make([]byte, int(kl))
+	if kl := int(bUint16(hdr[2:4])); kl > 0 {
+		key = valBuf[bp : bp+kl]
+		bp += kl
 		if err = readAtLeast(cn.nc, key, kl); err != nil {
 			return nil, nil, nil, nil, err
 		}
 	}
-	var value []byte
-	vl := total - el - kl
-	if vl > 0 {
-		value = make([]byte, vl)
+	if vl := total - bp; vl > 0 {
+		value = valBuf[bp:total]
 		if err = readAtLeast(cn.nc, value, vl); err != nil {
 			return nil, nil, nil, nil, err
 		}
 	}
-	return hdr, key, extras, value, nil
+	copy(valBuf[total:], hdr)
+	return valBuf[total:], key, extras, value, nil
 }
 
 func (c *Client) parseUintResponse(key string, cn *conn) (uint64, error) {
@@ -602,6 +785,7 @@ func (c *Client) parseItemResponse(key string, cn *conn, release bool) (*Item, e
 	}, nil
 }
 
+// ==================================================================
 // GetMulti is a batch version of Get. The returned map from keys to
 // items may have fewer elements than the input slice, due to memcache
 // cache misses. Each key must be at most 250 bytes in length.
@@ -622,11 +806,11 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 		chs = append(chs, ch)
 		go func(addr *Addr, keys []string, ch chan *Item) {
 			defer close(ch)
-			cn, err := c.getConn(addr)
+			cn, err := c.getFreeConn(addr)
+			defer c.condRelease(cn, &err)
 			if err != nil {
 				return
 			}
-			defer c.condRelease(cn, &err)
 			for _, k := range keys {
 				if err = c.sendConnCommand(cn, k, cmdGetKQ, nil, 0, nil); err != nil {
 					return
@@ -656,17 +840,20 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 	return m, nil
 }
 
+// ==================================================================
 // Set writes the given item, unconditionally.
 func (c *Client) Set(item *Item) error {
 	return c.populateOne(cmdSet, item, 0)
 }
 
+// ==================================================================
 // Add writes the given item, if no value already exists for its
 // key. ErrNotStored is returned if that condition is not met.
 func (c *Client) Add(item *Item) error {
 	return c.populateOne(cmdAdd, item, 0)
 }
 
+// ==================================================================
 // CompareAndSwap writes the given item that was previously returned
 // by Get, if the value was neither modified or evicted between the
 // Get and the CompareAndSwap calls. The item's Key should not change
@@ -679,11 +866,22 @@ func (c *Client) CompareAndSwap(item *Item) error {
 }
 
 func (c *Client) populateOne(cmd command, item *Item, casid uint64) error {
-	extras := make([]byte, 8)
+	// get buffer from pool
+	extp := c.bufPool.Get()
+	extras := *extp
+	extras = extras[:8]
+
+	// put buffer into pool
+	defer func() {
+		extp = c.bufPool.CleanBuf(extp)
+		c.bufPool.Put(extp)
+	}()
+
 	putUint32(extras, item.Flags)
 	putUint32(extras[4:8], uint32(item.Expiration))
 	cn, err := c.sendCommand(item.Key, cmd, item.Value, casid, extras)
 	if err != nil {
+		c.condRelease(cn, &err)
 		return err
 	}
 	hdr, _, _, _, err := c.parseResponse(item.Key, cn)
@@ -696,11 +894,13 @@ func (c *Client) populateOne(cmd command, item *Item, casid uint64) error {
 	return nil
 }
 
+// ==================================================================
 // Delete deletes the item with the provided key. The error ErrCacheMiss is
 // returned if the item didn't already exist in the cache.
 func (c *Client) Delete(key string) error {
 	cn, err := c.sendCommand(key, cmdDelete, nil, 0, nil)
 	if err != nil {
+		c.condRelease(cn, &err)
 		return err
 	}
 	_, _, _, _, err = c.parseResponse(key, cn)
@@ -708,6 +908,7 @@ func (c *Client) Delete(key string) error {
 	return err
 }
 
+// ==================================================================
 // Increment atomically increments key by delta. The return value is
 // the new value after being incremented or an error. If the value
 // didn't exist in memcached the error is ErrCacheMiss. The value in
@@ -717,6 +918,7 @@ func (c *Client) Increment(key string, delta uint64) (newValue uint64, err error
 	return c.incrDecr(cmdIncr, key, delta)
 }
 
+// ==================================================================
 // Decrement atomically decrements key by delta. The return value is
 // the new value after being decremented or an error. If the value
 // didn't exist in memcached the error is ErrCacheMiss. The value in
@@ -728,7 +930,17 @@ func (c *Client) Decrement(key string, delta uint64) (newValue uint64, err error
 }
 
 func (c *Client) incrDecr(cmd command, key string, delta uint64) (uint64, error) {
-	extras := make([]byte, 20)
+	// get buffer from pool
+	extp := c.bufPool.Get()
+	extras := *extp
+	extras = extras[:20]
+
+	// put buffer into pool
+	defer func() {
+		extp = c.bufPool.CleanBuf(extp)
+		c.bufPool.Put(extp)
+	}()
+
 	putUint64(extras, delta)
 	// Set expiration to 0xfffffff, so the command fails if the key
 	// does not exist.
@@ -737,11 +949,13 @@ func (c *Client) incrDecr(cmd command, key string, delta uint64) (uint64, error)
 	}
 	cn, err := c.sendCommand(key, cmd, nil, 0, extras)
 	if err != nil {
+		c.condRelease(cn, &err)
 		return 0, err
 	}
 	return c.parseUintResponse(key, cn)
 }
 
+// ==================================================================
 // Flush removes all the items in the cache after expiration seconds. If
 // expiration is <= 0, it removes all the items right now.
 func (c *Client) Flush(expiration int) error {
@@ -757,7 +971,7 @@ func (c *Client) Flush(expiration int) error {
 		putUint32(extras, uint32(expiration))
 	}
 	for _, addr := range servers {
-		cn, err := c.getConn(addr)
+		cn, err := c.getFreeConn(addr)
 		if err != nil {
 			failed = append(failed, addr)
 			errs = append(errs, err)

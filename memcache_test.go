@@ -27,22 +27,22 @@ import (
 	"time"
 )
 
-const testServer = "localhost:11211"
+const testServer = "memcached:11211"
 
 func (c *Client) totalOpen() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	count := 0
 	for _, v := range c.freeconn {
-		count += len(v)
+		count += len(v.limit)
 	}
 	return count
 }
 
-func newLocalhostServer(tb testing.TB) *Client {
+func newDockerServer(tb testing.TB) *Client {
 	c, err := net.Dial("tcp", testServer)
 	if err != nil {
-		tb.Skip("skipping test; no server running at %s", testServer)
+		tb.Skip(fmt.Sprintf("skipping test; no server running at %s", testServer))
 		return nil
 	}
 	c.Write([]byte("flush_all\r\n"))
@@ -50,6 +50,7 @@ func newLocalhostServer(tb testing.TB) *Client {
 	client, err := New(testServer)
 	if err != nil {
 		tb.Fatal(err)
+		return nil
 	}
 	return client
 }
@@ -57,7 +58,7 @@ func newLocalhostServer(tb testing.TB) *Client {
 func newUnixServer(tb testing.TB) (*exec.Cmd, *Client) {
 	sock := fmt.Sprintf("/tmp/test-gomemcache-%d.sock", os.Getpid())
 	os.Remove(sock)
-	cmd := exec.Command("memcached", "-s", sock)
+	cmd := exec.Command("memcached", "-u", "root", "-s", sock)
 	if err := cmd.Start(); err != nil {
 		tb.Skip("skipping test; couldn't find memcached")
 		return nil, nil
@@ -77,15 +78,18 @@ func newUnixServer(tb testing.TB) (*exec.Cmd, *Client) {
 	return cmd, c
 }
 
-func TestLocalhost(t *testing.T) {
-	testWithClient(t, newLocalhostServer(t))
+func TestDocker(t *testing.T) {
+	testWithClient(t, newDockerServer(t))
 }
 
 // Run the memcached binary as a child process and connect to its unix socket.
 func TestUnixSocket(t *testing.T) {
 	cmd, c := newUnixServer(t)
-	defer cmd.Wait()
-	defer cmd.Process.Kill()
+	defer func() {
+		time.Sleep(time.Duration(1) * time.Second)
+		cmd.Process.Kill()
+		cmd.Wait()
+	}()
 	testWithClient(t, c)
 }
 

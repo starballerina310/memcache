@@ -8,8 +8,8 @@ import (
 	"time"
 )
 
-func benchmarkSet(b *testing.B, item *Item) {
-	cmd, c := newUnixServer(b)
+func benchmarkNewSet(b *testing.B, item *Item) {
+	c := newDockerServer(b)
 	c.SetTimeout(time.Duration(-1))
 	b.SetBytes(int64(len(item.Key) + len(item.Value)))
 	b.ResetTimer()
@@ -19,12 +19,10 @@ func benchmarkSet(b *testing.B, item *Item) {
 		}
 	}
 	b.StopTimer()
-	cmd.Process.Kill()
-	cmd.Wait()
 }
 
-func benchmarkSetGet(b *testing.B, item *Item) {
-	cmd, c := newUnixServer(b)
+func benchmarkNewSetGet(b *testing.B, item *Item) {
+	c := newDockerServer(b)
 	c.SetTimeout(time.Duration(-1))
 	key := item.Key
 	b.SetBytes(int64(len(item.Key) + len(item.Value)))
@@ -38,8 +36,6 @@ func benchmarkSetGet(b *testing.B, item *Item) {
 		}
 	}
 	b.StopTimer()
-	cmd.Process.Kill()
-	cmd.Wait()
 }
 
 func largeItem() *Item {
@@ -52,27 +48,27 @@ func smallItem() *Item {
 	return &Item{Key: "foo", Value: []byte("bar")}
 }
 
-func BenchmarkSet(b *testing.B) {
-	benchmarkSet(b, smallItem())
+func BenchmarkNewSet(b *testing.B) {
+	benchmarkNewSet(b, smallItem())
 }
 
-func BenchmarkSetLarge(b *testing.B) {
-	benchmarkSet(b, largeItem())
+func BenchmarkNewSetLarge(b *testing.B) {
+	benchmarkNewSet(b, largeItem())
 }
 
-func BenchmarkSetGet(b *testing.B) {
-	benchmarkSetGet(b, smallItem())
+func BenchmarkNewSetGet(b *testing.B) {
+	benchmarkNewSetGet(b, smallItem())
 }
 
-func BenchmarkSetGetLarge(b *testing.B) {
-	benchmarkSetGet(b, largeItem())
+func BenchmarkNewSetGetLarge(b *testing.B) {
+	benchmarkNewSetGet(b, largeItem())
 }
 
-func benchmarkConcurrentSetGet(b *testing.B, item *Item, count int, opcount int) {
+func benchmarkNewConcurrentSetGet(b *testing.B, item *Item, count int, opcount int) {
 	mp := runtime.GOMAXPROCS(0)
 	defer runtime.GOMAXPROCS(mp)
 	runtime.GOMAXPROCS(count)
-	cmd, c := newUnixServer(b)
+	c := newDockerServer(b)
 	c.SetTimeout(time.Duration(-1))
 	// Items are not thread safe
 	items := make([]*Item, count)
@@ -102,13 +98,11 @@ func benchmarkConcurrentSetGet(b *testing.B, item *Item, count int, opcount int)
 		wg.Wait()
 	}
 	b.StopTimer()
-	cmd.Process.Kill()
-	cmd.Wait()
 }
 
-func BenchmarkGetCacheMiss(b *testing.B) {
+func BenchmarkNewGetCacheMiss(b *testing.B) {
 	key := "not"
-	cmd, c := newUnixServer(b)
+	c := newDockerServer(b)
 	c.SetTimeout(time.Duration(-1))
 	c.Delete(key)
 	b.ResetTimer()
@@ -118,22 +112,20 @@ func BenchmarkGetCacheMiss(b *testing.B) {
 		}
 	}
 	b.StopTimer()
-	cmd.Process.Kill()
-	cmd.Wait()
 }
 
-func BenchmarkConcurrentSetGetSmall10_100(b *testing.B) {
-	benchmarkConcurrentSetGet(b, smallItem(), 10, 100)
+func BenchmarkNewConcurrentSetGetSmall10_100(b *testing.B) {
+	benchmarkNewConcurrentSetGet(b, smallItem(), 10, 100)
 }
 
-func BenchmarkConcurrentSetGetLarge10_100(b *testing.B) {
-	benchmarkConcurrentSetGet(b, largeItem(), 10, 100)
+func BenchmarkNewConcurrentSetGetLarge10_100(b *testing.B) {
+	benchmarkNewConcurrentSetGet(b, largeItem(), 10, 100)
 }
 
-func BenchmarkConcurrentSetGetSmall20_100(b *testing.B) {
-	benchmarkConcurrentSetGet(b, smallItem(), 20, 100)
+func BenchmarkNewConcurrentSetGetSmall20_100(b *testing.B) {
+	benchmarkNewConcurrentSetGet(b, smallItem(), 20, 100)
 }
 
-func BenchmarkConcurrentSetGetLarge20_100(b *testing.B) {
-	benchmarkConcurrentSetGet(b, largeItem(), 20, 100)
+func BenchmarkNewConcurrentSetGetLarge20_100(b *testing.B) {
+	benchmarkNewConcurrentSetGet(b, largeItem(), 20, 100)
 }

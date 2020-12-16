@@ -1,0 +1,18 @@
+version: '3.1'
+services:
+  gomemcache:
+    build: .
+    privileged: true
+    command: /sbin/init
+    tty: true
+    depends_on:
+      - memcached
+    links:
+      - memcached
+    environment:
+      - MEMCACHED_HOST=memcached
+      - MEMCACHED_PORT=11211
+    volumes:
+      - .:/.go/src/memcache
+  memcached:
+    image: memcached

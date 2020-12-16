@@ -1,0 +1,42 @@
+benchmark									old ns/op		new ns/op	delta
+BenchmarkOldSet-2							308201        	471427    	+52.96%
+BenchmarkOldSetLarge-2						580132        	463082     	-20.18%
+BenchmarkOldSetGet-2						619947        	1227609    	+98.02%
+BenchmarkOldSetGetLarge-2					1160271      	792993     	-31.65%
+BenchmarkOldGetCacheMiss-2					441471        	395608     	-10.39%
+BenchmarkOldConcurrentSetGetSmall10_100-2	173818017     	127613078  	-26.58%
+BenchmarkOldConcurrentSetGetLarge10_100-2	199804475     	149008989  	-25.42%
+BenchmarkOldConcurrentSetGetSmall20_100-2	376584100     	228427040  	-39.34%
+BenchmarkOldConcurrentSetGetLarge20_100-2	551470400     	235043140  	-57.38%
+
+benchmark									old MB/s     	new MB/s  	speedup
+BenchmarkOldSet-2							0.02         	0.01       	0.50x
+BenchmarkOldSetLarge-2						2.18         	2.73       	1.25x
+BenchmarkOldSetGet-2						0.01         	0.00       	0.00x
+BenchmarkOldSetGetLarge-2					1.09         	1.59       	1.46x
+BenchmarkOldConcurrentSetGetSmall10_100-2	0.03         	0.05       	1.67x
+BenchmarkOldConcurrentSetGetLarge10_100-2	6.33         	8.48       	1.34x
+BenchmarkOldConcurrentSetGetSmall20_100-2	0.03         	0.05       	1.67x
+BenchmarkOldConcurrentSetGetLarge20_100-2	4.58         	10.76      	2.35x
+
+benchmark									old allocs     	new allocs	delta
+BenchmarkOldSet-2							2              	0         	-100.00%
+BenchmarkOldSetLarge-2						2              	0          	-100.00%
+BenchmarkOldSetGet-2						6              	2          	- 66.67%
+BenchmarkOldSetGetLarge-2					6              	2          	- 66.67%
+BenchmarkOldGetCacheMiss-2					2              	1          	- 50.00%
+BenchmarkOldConcurrentSetGetSmall10_100-2	6134           	2024      	- 67.00%
+BenchmarkOldConcurrentSetGetLarge10_100-2	6161           	2040      	- 66.89%
+BenchmarkOldConcurrentSetGetSmall20_100-2	12391          	4218       	- 65.96%
+BenchmarkOldConcurrentSetGetLarge20_100-2	12436          	4272       	- 65.65%
+
+benchmark									old bytes     	new bytes 	delta
+BenchmarkOldSet-2							40            	0          	-100.00%
+BenchmarkOldSetLarge-2						40            	0          	-100.00%
+BenchmarkOldSetGet-2						160           	88        	- 45.00%
+BenchmarkOldSetGetLarge-2					1184          	1233      	+  4.14%
+BenchmarkOldGetCacheMiss-2					64            	32        	- 50.00%
+BenchmarkOldConcurrentSetGetSmall10_100-2	167762        	90134     	- 46.27%
+BenchmarkOldConcurrentSetGetLarge10_100-2	1194533       	1237289    	+  3.58%
+BenchmarkOldConcurrentSetGetSmall20_100-2	338781        	189529    	- 44.06%
+BenchmarkOldConcurrentSetGetLarge20_100-2	2394948       	2486102    	+  3.81%
