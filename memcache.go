@@ -340,22 +340,45 @@ func New(server ...string) (*Client, error) {
 	return NewFromServers(servers), nil
 }
 
+func NewWithMaxIdlePerAddr(maxIdlePerAddr int, server ...string) (*Client, error) {
+	servers, err := NewServerList(server...)
+	if err != nil {
+		return nil, err
+	}
+	return NewFromServersWithMaxIdlePerAddr(maxIdlePerAddr, servers), nil
+}
+
 // NewFromServers returns a new Client using the provided Servers.
 func NewFromServers(servers Servers) *Client {
 	cli := &Client{
 		timeout:        DefaultSocketTimeout,
 		maxIdlePerAddr: maxIdleConnsPerAddr,
 		servers:        servers,
-		freeconn:       make(map[string]*ConnPool),
 		bufPool:        newBufPool(poolSize()),
 	}
-	freeconn := make(map[string]*ConnPool)
-	addrList, _ := servers.Servers()
+	cli.initConnPool()
+	return cli
+}
+
+func NewFromServersWithMaxIdlePerAddr(maxIdlePerAddr int, servers Servers) *Client {
+	cli := &Client{
+		timeout:        DefaultSocketTimeout,
+		maxIdlePerAddr: maxIdlePerAddr,
+		servers:        servers,
+		bufPool:        newBufPool(poolSize()),
+	}
+	cli.initConnPool()
+	return cli
+}
+
+func (cli *Client) initConnPool() {
+	addrList, _ := cli.servers.Servers()
+	freeconn := make(map[string]*ConnPool, len(addrList))
 	for _, addr := range addrList {
-		freeconn[addr.s] = newConnPool(maxIdleConnsPerAddr, getConnWrapper(cli, addr))
+		freeconn[addr.s] = newConnPool(cli.maxIdlePerAddr, getConnWrapper(cli, addr))
 	}
 	cli.freeconn = freeconn
-	return cli
+	return
 }
 
 // ==================================================================
