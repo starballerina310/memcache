@@ -90,6 +90,7 @@ const (
 	DefaultSocketTimeout = 0
 	DefaultBufPoolSize   = 200000
 	DefaultKeepAlive     = time.Duration(10) * time.Second
+	DefaultWaitTimeout   = time.Duration(100) * time.Millisecond
 	maxIdleConnsPerAddr  = 10
 )
 
@@ -133,7 +134,7 @@ func (p *ConnPool) Get() *conn {
 	select {
 	case <-p.limit:
 	/* ignore */
-	default:
+	case <-time.After(DefaultWaitTimeout):
 		/* ignore */
 	}
 	return p.pool.Get().(*conn)
