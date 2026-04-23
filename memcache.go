@@ -478,8 +478,9 @@ type Item struct {
 // ==================================================================
 // conn is a connection to a server.
 type conn struct {
-	nc   net.Conn
-	addr *Addr
+	nc    net.Conn
+	addr  *Addr
+	dirty bool
 }
 
 // condRelease releases this connection if the error pointed to by err
@@ -497,7 +498,7 @@ func (c *Client) condRelease(cn *conn, err *error) {
 		}
 	default:
 		if cn != nil {
-			if ne, ok := (*err).(net.Error); ok && ne.Temporary() {
+			if ne, ok := (*err).(net.Error); ok && ne.Temporary() && !cn.dirty {
 				c.putFreeConn(cn)
 			} else if cn.nc != nil {
 				cn.nc.Close()
@@ -642,6 +643,9 @@ func (c *Client) sendCommand(key string, cmd command, value []byte, casid uint64
 	err = c.sendConnCommand(cn, key, cmd, value, casid, extras)
 	if err != nil {
 		// retry once
+		if cn != nil && cn.nc != nil {
+			cn.nc.Close()
+		}
 		cn, err = c.getFreeConn(addr)
 		if err != nil {
 			return nil, err
@@ -731,6 +735,7 @@ func (c *Client) parseResponse(rKey string, cn *conn) ([]byte, []byte, []byte, [
 		c.bufPool.Put(hdrp)
 	}()
 
+	cn.dirty = true
 	if err = readAtLeast(cn.nc, hdr, 24); err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -774,6 +779,7 @@ func (c *Client) parseResponse(rKey string, cn *conn) ([]byte, []byte, []byte, [
 		}
 	}
 	copy(valBuf[total:], hdr)
+	cn.dirty = false
 	return valBuf[total:], key, extras, value, nil
 }
 
