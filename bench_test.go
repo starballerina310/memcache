@@ -87,10 +87,12 @@ func benchmarkNewConcurrentSetGet(b *testing.B, item *Item, count int, opcount i
 				defer wg.Done()
 				for k := 0; k < opcount; k++ {
 					if err := c.Set(it); err != nil {
-						b.Fatal(err)
+						b.Error(err)
+						return
 					}
 					if _, err := c.Get(key); err != nil {
-						b.Fatal(err)
+						b.Error(err)
+						return
 					}
 				}
 			}()

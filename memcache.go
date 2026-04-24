@@ -24,6 +24,7 @@ import (
 	"errors"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"sync"
 	"syscall"
@@ -66,6 +67,11 @@ var (
 	// ErrBadIncrDec is returned when performing a incr/decr on non-numeric values.
 	ErrBadIncrDec = errors.New("memcache: incr or decr on non-numeric value")
 
+	// ErrNoFreeConnections is returned when the connection pool for a server
+	// has reached its maximum open connection cap and no idle connection
+	// became available within the configured wait timeout.
+	ErrNoFreeConnections = errors.New("memcache: no free connections (pool exhausted)")
+
 	putUint16 = binary.BigEndian.PutUint16
 	putUint32 = binary.BigEndian.PutUint32
 	putUint64 = binary.BigEndian.PutUint64
@@ -82,71 +88,197 @@ var (
 	}
 )
 
-// DefaultPoolTimeout is the default pool timeout
-// DefaultSocketTimeout is the default socket timeout
-// DefaultBufPoolSize is the default size for buffer pool
-// maxIdleConnsPerAddr is the default size for connection pool
+// DefaultSocketTimeout is the per-operation (read/write) socket timeout.
+// DefaultBufPoolSize is the default size for buffer pool.
+// DefaultKeepAlive is the TCP keep-alive period.
+// DefaultWaitTimeout is how long Get blocks when the pool has no idle conn
+// and cannot open a new one because it is at the open-connection cap.
+// maxIdleConnsPerAddr is the default idle-connection buffer size. It is
+// sized equal to maxOpenConnsPerAddr so that at steady state every open
+// connection can be parked back into the idle buffer, avoiding open/close
+// churn.
+// maxOpenConnsPerAddr is the default hard cap on total open connections
+// per address. Bounding total open connections (not just idle ones) is what
+// prevents the "connections↑ → memcached degrades → disconnects → more
+// connections" feedback loop during peaks or restarts.
+// maxConcurrentDialsPerAddr caps the number of in-flight dial() syscalls
+// per pool. When many client processes start simultaneously, the combined
+// dial rate against memcached is bounded by
+// N_clients × maxConcurrentDialsPerAddr rather than
+// N_clients × maxOpenConnsPerAddr. This is what keeps a cold-start of
+// hundreds of client processes from firing tens of thousands of
+// simultaneous SYNs at memcached.
 const (
-	DefaultSocketTimeout = 0
-	DefaultBufPoolSize   = 200000
-	DefaultKeepAlive     = time.Duration(10) * time.Second
-	DefaultWaitTimeout   = time.Duration(100) * time.Millisecond
-	maxIdleConnsPerAddr  = 10
+	DefaultSocketTimeout      = time.Duration(300) * time.Millisecond
+	DefaultBufPoolSize        = 200000
+	DefaultKeepAlive          = time.Duration(10) * time.Second
+	DefaultWaitTimeout        = time.Duration(100) * time.Millisecond
+	maxIdleConnsPerAddr       = 250
+	maxOpenConnsPerAddr       = 250
+	maxConcurrentDialsPerAddr = 4
 )
 
 // ==================================================================
 // ConnPool
 // ==================================================================
+
+// ConnPool is a bounded connection pool for a single server address.
+//
+// It enforces a hard upper bound on the number of simultaneously open
+// connections (maxOpen) via the `sem` buffered channel used as a semaphore.
+// Idle, ready-to-reuse connections are held in the `idle` channel.
+// `dialSem` additionally bounds how many dial()s can be in flight at once,
+// which caps the per-pool SYN rate during cold start or reconnect storms.
+//
+// This is intentionally different from the usual sync.Pool-based design
+// because sync.Pool's New function is called ad-hoc and cannot enforce a
+// global open-connection cap; under pressure that leads to unbounded
+// connection creation, which is exactly the feedback loop we want to avoid.
 type ConnPool struct {
-	pool  sync.Pool
-	limit chan struct{}
+	newFn       func() (*conn, error)
+	idle        chan *conn
+	sem         chan struct{}
+	dialSem     chan struct{}
+	waitTimeout time.Duration
 }
 
-func getConnWrapper(c *Client, addr *Addr) func() *conn {
-	return func() *conn {
-		cn, err := c.getNewConn(addr)
-		if err != nil {
-			return nil
-		}
-		return cn
+func getConnWrapper(c *Client, addr *Addr) func() (*conn, error) {
+	return func() (*conn, error) {
+		return c.getNewConn(addr)
 	}
 }
 
-func newConnPool(lim int, fn func() *conn) *ConnPool {
-	// init connection pool
-	p := ConnPool{
-		pool: sync.Pool{
-			New: func() interface{} {
-				return fn()
-			},
-		},
-		limit: make(chan struct{}, lim),
+func newConnPool(maxIdle, maxOpen int, waitTimeout time.Duration, fn func() (*conn, error)) *ConnPool {
+	if maxOpen < maxIdle {
+		maxOpen = maxIdle
 	}
-	// set idle connections
-	for i := 0; i < lim; i++ {
-		p.Put(fn())
+	dialCap := maxConcurrentDialsPerAddr
+	if dialCap > maxOpen {
+		dialCap = maxOpen
 	}
-	return &p
+	if dialCap < 1 {
+		dialCap = 1
+	}
+	// The pool starts empty on purpose: eager pre-warming would cause every
+	// client process to fire maxIdle dials at startup, which turns a fleet
+	// rollout into a thundering herd against memcached. Connections are
+	// opened lazily on demand, rate-limited by dialSem, and capped in total
+	// by sem. Callers that explicitly want warm connections can call
+	// Client.Warmup.
+	return &ConnPool{
+		newFn:       fn,
+		idle:        make(chan *conn, maxIdle),
+		sem:         make(chan struct{}, maxOpen),
+		dialSem:     make(chan struct{}, dialCap),
+		waitTimeout: waitTimeout,
+	}
 }
 
-func (p *ConnPool) Get() *conn {
-	// total connections <= upperlimit
+// Get returns a usable connection. It tries, in order:
+//  1. Fast path: an existing idle connection.
+//  2. Open a new one if we are below the open-connection cap.
+//  3. Wait up to waitTimeout for either an idle connection to return or
+//     for an open slot to free up; otherwise return ErrNoFreeConnections.
+//
+// Returning an error instead of blocking indefinitely is what breaks the
+// "peak → timeouts → more connections → worse peak" feedback loop: callers
+// fail fast and shed load rather than piling on memcached.
+func (p *ConnPool) Get() (*conn, error) {
 	select {
-	case <-p.limit:
-	/* ignore */
-	case <-time.After(DefaultWaitTimeout):
-		/* ignore */
-	}
-	return p.pool.Get().(*conn)
-}
-
-func (p *ConnPool) Put(c *conn) {
-	select {
-	// total idle connetions <= limit
-	case p.limit <- struct{}{}:
-		p.pool.Put(c)
+	case cn := <-p.idle:
+		return cn, nil
 	default:
-		c.nc.Close()
+	}
+	select {
+	case p.sem <- struct{}{}:
+		return p.openConn()
+	default:
+	}
+	timer := time.NewTimer(p.waitTimeout)
+	defer timer.Stop()
+	select {
+	case cn := <-p.idle:
+		return cn, nil
+	case p.sem <- struct{}{}:
+		return p.openConn()
+	case <-timer.C:
+		return nil, ErrNoFreeConnections
+	}
+}
+
+// openConn dials a new connection through dialSem so that only a bounded
+// number of dial() syscalls are in flight per pool at any time. The caller
+// must already hold a slot in p.sem; on any error (including a dialSem
+// wait timeout) the sem slot is released before returning.
+func (p *ConnPool) openConn() (*conn, error) {
+	timer := time.NewTimer(p.waitTimeout)
+	defer timer.Stop()
+	select {
+	case p.dialSem <- struct{}{}:
+	case <-timer.C:
+		<-p.sem
+		return nil, ErrNoFreeConnections
+	}
+	cn, err := p.newFn()
+	<-p.dialSem
+	if err != nil {
+		<-p.sem
+		return nil, err
+	}
+	return cn, nil
+}
+
+// Put returns a healthy connection to the idle buffer. If the idle buffer
+// is full the connection is closed and the corresponding open-connection
+// slot is released.
+func (p *ConnPool) Put(cn *conn) {
+	if cn == nil {
+		return
+	}
+	if cn.nc == nil {
+		p.release()
+		return
+	}
+	select {
+	case p.idle <- cn:
+	default:
+		cn.nc.Close()
+		p.release()
+	}
+}
+
+// Discard closes a broken connection and releases its open-connection slot
+// so that a new connection may be opened in its place.
+func (p *ConnPool) Discard(cn *conn) {
+	if cn == nil {
+		return
+	}
+	if cn.nc != nil {
+		cn.nc.Close()
+	}
+	p.release()
+}
+
+// Close drains and closes all idle connections. Connections currently
+// checked out will release their slots via Put/Discard as usual.
+func (p *ConnPool) Close() {
+	for {
+		select {
+		case cn := <-p.idle:
+			if cn != nil && cn.nc != nil {
+				cn.nc.Close()
+			}
+			p.release()
+		default:
+			return
+		}
+	}
+}
+
+func (p *ConnPool) release() {
+	select {
+	case <-p.sem:
+	default:
 	}
 }
 
@@ -349,11 +481,23 @@ func NewWithMaxIdlePerAddr(maxIdlePerAddr int, server ...string) (*Client, error
 	return NewFromServersWithMaxIdlePerAddr(maxIdlePerAddr, servers), nil
 }
 
+// NewWithMaxOpenPerAddr returns a client where both the idle buffer size and
+// the hard cap on total open connections per address are configurable.
+func NewWithMaxOpenPerAddr(maxIdlePerAddr, maxOpenPerAddr int, server ...string) (*Client, error) {
+	servers, err := NewServerList(server...)
+	if err != nil {
+		return nil, err
+	}
+	return NewFromServersWithMaxOpenPerAddr(maxIdlePerAddr, maxOpenPerAddr, servers), nil
+}
+
 // NewFromServers returns a new Client using the provided Servers.
 func NewFromServers(servers Servers) *Client {
 	cli := &Client{
 		timeout:        DefaultSocketTimeout,
 		maxIdlePerAddr: maxIdleConnsPerAddr,
+		maxOpenPerAddr: maxOpenConnsPerAddr,
+		waitTimeout:    DefaultWaitTimeout,
 		servers:        servers,
 		bufPool:        newBufPool(poolSize()),
 	}
@@ -365,6 +509,24 @@ func NewFromServersWithMaxIdlePerAddr(maxIdlePerAddr int, servers Servers) *Clie
 	cli := &Client{
 		timeout:        DefaultSocketTimeout,
 		maxIdlePerAddr: maxIdlePerAddr,
+		maxOpenPerAddr: maxOpenConnsPerAddr,
+		waitTimeout:    DefaultWaitTimeout,
+		servers:        servers,
+		bufPool:        newBufPool(poolSize()),
+	}
+	cli.initConnPool()
+	return cli
+}
+
+// NewFromServersWithMaxOpenPerAddr returns a client where both the idle
+// buffer size and the hard cap on total open connections per address are
+// configurable.
+func NewFromServersWithMaxOpenPerAddr(maxIdlePerAddr, maxOpenPerAddr int, servers Servers) *Client {
+	cli := &Client{
+		timeout:        DefaultSocketTimeout,
+		maxIdlePerAddr: maxIdlePerAddr,
+		maxOpenPerAddr: maxOpenPerAddr,
+		waitTimeout:    DefaultWaitTimeout,
 		servers:        servers,
 		bufPool:        newBufPool(poolSize()),
 	}
@@ -376,7 +538,7 @@ func (cli *Client) initConnPool() {
 	addrList, _ := cli.servers.Servers()
 	freeconn := make(map[string]*ConnPool, len(addrList))
 	for _, addr := range addrList {
-		freeconn[addr.s] = newConnPool(cli.maxIdlePerAddr, getConnWrapper(cli, addr))
+		freeconn[addr.s] = newConnPool(cli.maxIdlePerAddr, cli.maxOpenPerAddr, cli.waitTimeout, getConnWrapper(cli, addr))
 	}
 	cli.freeconn = freeconn
 	return
@@ -388,6 +550,8 @@ func (cli *Client) initConnPool() {
 type Client struct {
 	timeout        time.Duration
 	maxIdlePerAddr int
+	maxOpenPerAddr int
+	waitTimeout    time.Duration
 	servers        Servers
 	mu             sync.RWMutex
 	freeconn       map[string]*ConnPool
@@ -420,7 +584,7 @@ func (c *Client) MaxIdleConnsPerAddr() int {
 // SetMaxIdleConnsPerAddr changes the maximum number of
 // idle connections kept per server. If maxIdle < 0,
 // no idle connections are kept. If maxIdle == 0,
-// the default number (currently 2) is used.
+// the default number is used.
 func (c *Client) SetMaxIdleConnsPerAddr(maxIdle int) {
 	if maxIdle == 0 {
 		maxIdle = maxIdleConnsPerAddr
@@ -433,13 +597,101 @@ func (c *Client) SetMaxIdleConnsPerAddr(maxIdle int) {
 		freeconn := make(map[string]*ConnPool)
 		if servers, serversErr := c.servers.Servers(); serversErr == nil {
 			for _, addr := range servers {
-				freeconn[addr.s] = newConnPool(maxIdle, getConnWrapper(c, addr))
+				freeconn[addr.s] = newConnPool(maxIdle, c.maxOpenPerAddr, c.waitTimeout, getConnWrapper(c, addr))
 			}
 		}
 		c.freeconn = freeconn
 	} else {
 		c.closeIdleConns()
 		c.freeconn = nil
+	}
+}
+
+// MaxOpenConnsPerAddr returns the hard cap on total open connections per
+// server address.
+func (c *Client) MaxOpenConnsPerAddr() int {
+	return c.maxOpenPerAddr
+}
+
+// SetMaxOpenConnsPerAddr changes the hard cap on total open connections
+// per server address. If maxOpen <= 0, the default is used.
+func (c *Client) SetMaxOpenConnsPerAddr(maxOpen int) {
+	if maxOpen <= 0 {
+		maxOpen = maxOpenConnsPerAddr
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.maxOpenPerAddr = maxOpen
+	c.closeIdleConns()
+	freeconn := make(map[string]*ConnPool)
+	if servers, serversErr := c.servers.Servers(); serversErr == nil {
+		for _, addr := range servers {
+			freeconn[addr.s] = newConnPool(c.maxIdlePerAddr, maxOpen, c.waitTimeout, getConnWrapper(c, addr))
+		}
+	}
+	c.freeconn = freeconn
+}
+
+// WaitTimeout returns the per-request wait-for-connection timeout.
+func (c *Client) WaitTimeout() time.Duration {
+	return c.waitTimeout
+}
+
+// SetWaitTimeout sets how long a caller blocks waiting for a free
+// connection from the pool before getting ErrNoFreeConnections. This only
+// affects the case when the pool is at its open-connection cap. If
+// waitTimeout <= 0, the default is used.
+func (c *Client) SetWaitTimeout(waitTimeout time.Duration) {
+	if waitTimeout <= 0 {
+		waitTimeout = DefaultWaitTimeout
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.waitTimeout = waitTimeout
+	for _, p := range c.freeconn {
+		if p != nil {
+			p.waitTimeout = waitTimeout
+		}
+	}
+}
+
+// Warmup proactively opens up to perAddr connections to every configured
+// server, spacing each dial by a random jitter of [0, jitter). It is an
+// opt-in alternative to eager pre-warming at New time. Use it when you
+// want warm connections but still need fleet-wide startup smoothing:
+// callers in different processes will stagger their dials instead of
+// firing simultaneously.
+//
+// Warmup stops for an address on the first dial error. It respects the
+// pool's dialSem and open-connection cap, so calling it with a large
+// perAddr value is safe.
+func (c *Client) Warmup(perAddr int, jitter time.Duration) {
+	if perAddr <= 0 {
+		return
+	}
+	c.mu.RLock()
+	pools := make([]*ConnPool, 0, len(c.freeconn))
+	for _, p := range c.freeconn {
+		if p != nil {
+			pools = append(pools, p)
+		}
+	}
+	c.mu.RUnlock()
+	for _, p := range pools {
+		opened := make([]*conn, 0, perAddr)
+		for i := 0; i < perAddr; i++ {
+			if jitter > 0 {
+				time.Sleep(time.Duration(rand.Int63n(int64(jitter))))
+			}
+			cn, err := p.Get()
+			if err != nil {
+				break
+			}
+			opened = append(opened, cn)
+		}
+		for _, cn := range opened {
+			p.Put(cn)
+		}
 	}
 }
 
@@ -483,27 +735,23 @@ type conn struct {
 	dirty bool
 }
 
-// condRelease releases this connection if the error pointed to by err
-// is is nil (not an error) or is only a protocol level error (e.g. a
-// cache miss).  The purpose is to not recycle TCP connections that
-// are bad.
+// condRelease returns cn to the pool if the error is nil or only a
+// protocol-level error (cache miss, CAS conflict, etc.). Otherwise cn is
+// discarded so its slot in the open-connection cap is freed.
 func (c *Client) condRelease(cn *conn, err *error) {
+	if cn == nil {
+		return
+	}
 	switch *err {
 	case nil, ErrCacheMiss, ErrCASConflict, ErrNotStored, ErrBadIncrDec:
 		c.putFreeConn(cn)
 	case syscall.EPIPE:
-		if cn != nil && cn.nc != nil {
-			cn.nc.Close()
-			cn = nil
-		}
+		c.discardConn(cn)
 	default:
-		if cn != nil {
-			if ne, ok := (*err).(net.Error); ok && ne.Temporary() && !cn.dirty {
-				c.putFreeConn(cn)
-			} else if cn.nc != nil {
-				cn.nc.Close()
-			}
-			cn = nil
+		if ne, ok := (*err).(net.Error); ok && ne.Temporary() && !cn.dirty {
+			c.putFreeConn(cn)
+		} else {
+			c.discardConn(cn)
 		}
 	}
 }
@@ -514,17 +762,8 @@ func (c *Client) closeIdleConns() {
 		return
 	}
 	for k, v := range c.freeconn {
-		if v.limit != nil {
-			for len(v.limit) > 0 {
-				cn := v.Get()
-				if cn != nil && cn.nc != nil {
-					cn.nc.Close()
-					cn = nil
-				}
-				if cn == nil {
-					break
-				}
-			}
+		if v != nil {
+			v.Close()
 			c.freeconn[k] = nil
 		}
 	}
@@ -533,11 +772,35 @@ func (c *Client) closeIdleConns() {
 func (c *Client) putFreeConn(cn *conn) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if cn == nil {
+		return
+	}
 	freelist := c.freeconn[cn.addr.s]
 	if freelist == nil {
+		if cn.nc != nil {
+			cn.nc.Close()
+		}
 		return
 	}
 	freelist.Put(cn)
+}
+
+// discardConn closes a broken connection and releases its open-connection
+// slot in the pool so a replacement can be opened.
+func (c *Client) discardConn(cn *conn) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if cn == nil {
+		return
+	}
+	freelist := c.freeconn[cn.addr.s]
+	if freelist == nil {
+		if cn.nc != nil {
+			cn.nc.Close()
+		}
+		return
+	}
+	freelist.Discard(cn)
 }
 
 func (c *Client) getFreeConn(addr *Addr) (*conn, error) {
@@ -547,7 +810,7 @@ func (c *Client) getFreeConn(addr *Addr) (*conn, error) {
 	if freelist == nil {
 		return nil, ErrServerError
 	}
-	return freelist.Get(), nil
+	return freelist.Get()
 }
 
 // ==================================================================
@@ -593,20 +856,17 @@ func (c *Client) getNewConn(addr *Addr) (*conn, error) {
 		nc:   nc,
 		addr: addr,
 	}
-	if c.timeout > 0 {
-		nc.SetDeadline(time.Now().Add(c.timeout))
-	}
-	if _, ok := nc.(*net.TCPConn); ok {
-		err = nc.(*net.TCPConn).SetKeepAlive(true)
-		if err != nil {
+	// Do not call SetDeadline here: a one-shot deadline set at dial time
+	// would cause all subsequent I/O on a long-lived pooled connection to
+	// fail once c.timeout has elapsed. Deadlines are set per operation in
+	// sendConnCommand and parseResponse instead.
+	if tcp, ok := nc.(*net.TCPConn); ok {
+		if err = tcp.SetKeepAlive(true); err != nil {
 			nc.Close()
-			cn = nil
 			return nil, err
 		}
-		err = nc.(*net.TCPConn).SetKeepAlivePeriod(DefaultKeepAlive)
-		if err != nil {
+		if err = tcp.SetKeepAlivePeriod(DefaultKeepAlive); err != nil {
 			nc.Close()
-			cn = nil
 			return nil, err
 		}
 	}
@@ -640,26 +900,29 @@ func (c *Client) sendCommand(key string, cmd command, value []byte, casid uint64
 	if err != nil {
 		return nil, err
 	}
-	err = c.sendConnCommand(cn, key, cmd, value, casid, extras)
-	if err != nil {
-		// retry once
-		if cn != nil && cn.nc != nil {
-			cn.nc.Close()
-		}
-		cn, err = c.getFreeConn(addr)
-		if err != nil {
-			return nil, err
-		}
-		err = c.sendConnCommand(cn, key, cmd, value, casid, extras)
-		if err != nil {
-			return nil, err
-		}
+	// No in-library retry here. When memcached is under pressure, silently
+	// retrying amplifies load and makes the negative loop worse. On failure
+	// the connection is discarded by condRelease and the caller decides
+	// whether to retry.
+	if err = c.sendConnCommand(cn, key, cmd, value, casid, extras); err != nil {
 		return cn, err
 	}
-	return cn, err
+	return cn, nil
 }
 
 func (c *Client) sendConnCommand(cn *conn, key string, cmd command, value []byte, casid uint64, extras []byte) (err error) {
+	// Apply a per-request write deadline so a stuck/slow server does not
+	// occupy this connection (and a pool slot) indefinitely.
+	if c.timeout > 0 {
+		cn.nc.SetWriteDeadline(time.Now().Add(c.timeout))
+	}
+
+	// Mark the connection dirty before any write. A partial write (e.g. a
+	// Flush that times out mid-flight) leaves unsent or half-sent bytes on
+	// the wire, so the connection must not be returned to the idle pool.
+	// parseResponse clears this only after a full, successful response.
+	cn.dirty = true
+
 	// get buffer from pool
 	bufp := c.bufPool.Get()
 	buf := *bufp
@@ -735,7 +998,13 @@ func (c *Client) parseResponse(rKey string, cn *conn) ([]byte, []byte, []byte, [
 		c.bufPool.Put(hdrp)
 	}()
 
-	cn.dirty = true
+	// Apply a per-request read deadline covering header + body.
+	if c.timeout > 0 {
+		cn.nc.SetReadDeadline(time.Now().Add(c.timeout))
+	}
+
+	// cn.dirty is already true (set in sendConnCommand). It is cleared
+	// only after a full, successful parse below.
 	if err = readAtLeast(cn.nc, hdr, 24); err != nil {
 		return nil, nil, nil, nil, err
 	}

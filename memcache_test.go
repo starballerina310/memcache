@@ -34,7 +34,9 @@ func (c *Client) totalOpen() int {
 	defer c.mu.Unlock()
 	count := 0
 	for _, v := range c.freeconn {
-		count += len(v.limit)
+		if v != nil {
+			count += len(v.sem)
+		}
 	}
 	return count
 }
